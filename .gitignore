@@ -1,0 +1,19 @@
+# Environment Variables
+.env
+*.env
+
+# SQLite Database
+db.sqlite3
+*.sqlite3
+
+# Python Cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Media / Generated Data
+media/
+generated_videos/
+outputs/
+*.mp4
+*.mkv
