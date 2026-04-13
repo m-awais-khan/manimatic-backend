@@ -121,7 +121,7 @@ USE_I18N = True
 USE_TZ = True
 
 
-USE_S3 = os.environ.get('USE_S3') == 'True'
+USE_S3 = os.environ.get('USE_S3', 'False').lower() == 'true'
 
 if USE_S3:
     AWS_ACCESS_KEY_ID = os.environ.get('AWS_ACCESS_KEY_ID')
@@ -131,12 +131,22 @@ if USE_S3:
     AWS_S3_REGION_NAME = os.environ.get('AWS_S3_REGION_NAME', 'us-east-1')
     AWS_DEFAULT_ACL = 'public-read'
     
-    # Supabase uses v4 signatures
+    # Crucial Supabase S3 fixes:
     AWS_S3_SIGNATURE_VERSION = 's3v4'
+    AWS_S3_ADDRESSING_STYLE = 'virtual'
+    AWS_QUERYSTRING_AUTH = False  # Generate clean URLs without ugly tokens
     
+    # Force Boto3 to serve the frontend public link instead of the /s3/ authenticated link
+    if AWS_S3_ENDPOINT_URL:
+        try:
+            supabase_id = AWS_S3_ENDPOINT_URL.split('.')[0].split('//')[1]
+            AWS_S3_CUSTOM_DOMAIN = f'{supabase_id}.supabase.co/storage/v1/object/public/{AWS_STORAGE_BUCKET_NAME}'
+        except:
+            pass
+
     DEFAULT_FILE_STORAGE = 'storages.backends.s3boto3.S3Boto3Storage'
     
-    MEDIA_URL = f'{AWS_S3_ENDPOINT_URL}/{AWS_STORAGE_BUCKET_NAME}/media/'
+    MEDIA_URL = f'https://{AWS_S3_CUSTOM_DOMAIN}/' if 'AWS_S3_CUSTOM_DOMAIN' in locals() else f'{AWS_S3_ENDPOINT_URL}/{AWS_STORAGE_BUCKET_NAME}/media/'
     STATIC_URL = f'{AWS_S3_ENDPOINT_URL}/{AWS_STORAGE_BUCKET_NAME}/static/'
 else:
     STATIC_URL = 'static/'
