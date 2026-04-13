@@ -208,6 +208,8 @@ class ChatDetailView(APIView):
         
     def delete(self, request, pk):
         chat = get_object_or_404(Chat, pk=pk, user=request.user)
+        for scene in chat.scenes.all():
+            _delete_storage_file(scene.video_path)
         chat.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
@@ -288,5 +290,6 @@ class StitchedVideoDetailView(APIView):
     
     def delete(self, request, pk):
         sv = get_object_or_404(StitchedVideo, pk=pk, user=request.user)
+        _delete_storage_file(sv.video_path)
         sv.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
