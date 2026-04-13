@@ -68,11 +68,23 @@ def execute_manim_code(code, scene_id, quality="720p"):
                         
                         from django.core.files.storage import default_storage
                         from django.core.files.base import ContentFile
-                        
-                        with open(video_path, 'rb') as f:
-                            saved_path = default_storage.save(f"videos/scene_{scene_id}.mp4", ContentFile(f.read()))
+                        from django.conf import settings as dj_settings
 
-                        return default_storage.url(saved_path), None
+                        logger.info(f"USE_S3={getattr(dj_settings, 'USE_S3', False)}, storage backend={default_storage.__class__.__name__}")
+                        
+                        try:
+                            with open(video_path, 'rb') as f:
+                                file_content = f.read()
+                            
+                            s3_key = f"videos/scene_{scene_id}.mp4"
+                            logger.info(f"Saving {len(file_content)} bytes to storage key: {s3_key}")
+                            saved_path = default_storage.save(s3_key, ContentFile(file_content))
+                            public_url = default_storage.url(saved_path)
+                            logger.info(f"Successfully saved. Public URL: {public_url}")
+                            return public_url, None
+                        except Exception as upload_err:
+                            logger.error(f"Storage upload failed: {upload_err}", exc_info=True)
+                            return None, f"Storage upload failed: {str(upload_err)}"
                         
             return None, f"No mp4 file found. Manim output: {result.stdout}"
         else:
