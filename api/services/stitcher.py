@@ -157,18 +157,22 @@ def stitch_videos_task(stitched_video_id, transition='cut'):
             sv.save()
             return
         
-        # Convert URLs to absolute filesystem paths
+        # Convert URLs to absolute filesystem paths or keep HTTP URLs
         video_paths = []
         for url in video_urls:
             if url.startswith('/media/'):
                 path = os.path.join(settings.BASE_DIR, url.lstrip('/'))
                 path = os.path.normpath(path)
                 video_paths.append(path)
+            elif url.startswith('http://') or url.startswith('https://'):
+                video_paths.append(url)
             else:
                 video_paths.append(os.path.normpath(url))
         
-        # Verify all files exist
+        # Verify all local files exist
         for p in video_paths:
+            if p.startswith('http://') or p.startswith('https://'):
+                continue
             if not os.path.exists(p):
                 sv.status = 'error'
                 sv.error_message = f'Video file not found: {os.path.basename(p)}'
@@ -176,10 +180,13 @@ def stitch_videos_task(stitched_video_id, transition='cut'):
                 logger.error(f"Video not found: {p}")
                 return
         
+        import tempfile
+        from django.core.files.storage import default_storage
+        from django.core.files.base import ContentFile
+        
         output_filename = f"stitched_{uuid.uuid4().hex[:8]}.mp4"
-        output_dir = os.path.join(settings.MEDIA_ROOT, 'stitched')
-        os.makedirs(output_dir, exist_ok=True)
-        output_path = os.path.join(output_dir, output_filename)
+        temp_dir = tempfile.gettempdir()
+        output_path = os.path.join(temp_dir, output_filename)
 
         # Choose stitching method
         if transition == 'cut':
@@ -188,7 +195,13 @@ def stitch_videos_task(stitched_video_id, transition='cut'):
             result = _stitch_with_transition(video_paths, output_path, transition)
 
         if result.returncode == 0:
-            sv.video_path = f"/media/stitched/{output_filename}"
+            with open(output_path, 'rb') as f:
+                saved_path = default_storage.save(f"stitched/{output_filename}", ContentFile(f.read()))
+            sv.video_path = default_storage.url(saved_path)
+            
+            try: os.remove(output_path)
+            except: pass
+            
             sv.status = 'completed'
             logger.info(f"Stitch completed: {sv.video_path}")
         else:

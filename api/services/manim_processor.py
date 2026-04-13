@@ -66,13 +66,13 @@ def execute_manim_code(code, scene_id, quality="720p"):
                     if file.endswith(".mp4"):
                         video_path = os.path.join(root, file)
                         
-                        output_dir = os.path.join(settings.MEDIA_ROOT, 'videos')
-                        os.makedirs(output_dir, exist_ok=True)
+                        from django.core.files.storage import default_storage
+                        from django.core.files.base import ContentFile
+                        
+                        with open(video_path, 'rb') as f:
+                            saved_path = default_storage.save(f"videos/scene_{scene_id}.mp4", ContentFile(f.read()))
 
-                        final_path = os.path.join(output_dir, f"scene_{scene_id}.mp4")
-                        shutil.copy2(video_path, final_path)
-
-                        return f"/media/videos/scene_{scene_id}.mp4", None
+                        return default_storage.url(saved_path), None
                         
             return None, f"No mp4 file found. Manim output: {result.stdout}"
         else:
