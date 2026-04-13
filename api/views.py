@@ -15,6 +15,22 @@ import shutil
 from .services.generator import generate_scene_task
 from .services.stitcher import stitch_videos_task
 
+# ── S3 Debug View (temporary — remove in prod) ───────────────
+
+class S3DebugView(APIView):
+    """Quick endpoint to verify S3 config on Render without digging through logs."""
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        from django.core.files.storage import default_storage
+        return Response({
+            'USE_S3': getattr(django_settings, 'USE_S3', False),
+            'storage_backend': default_storage.__class__.__name__,
+            'bucket': getattr(django_settings, 'AWS_STORAGE_BUCKET_NAME', 'N/A'),
+            'endpoint': getattr(django_settings, 'AWS_S3_ENDPOINT_URL', 'N/A'),
+            'media_url': django_settings.MEDIA_URL,
+        })
+
 # ── Auth Views ──────────────────────────────────────────────
 
 class GoogleAuthView(APIView):

@@ -1,6 +1,8 @@
 import subprocess
 import os
 import json
+import urllib.request
+import tempfile as _tempfile
 from django.conf import settings
 import uuid
 import logging
@@ -157,27 +159,48 @@ def stitch_videos_task(stitched_video_id, transition='cut'):
             sv.save()
             return
         
-        # Convert URLs to absolute filesystem paths or keep HTTP URLs
+        # Convert URLs to absolute filesystem paths.
+        # S3/HTTPS URLs must be downloaded to temp files because
+        # ffmpeg's concat demuxer cannot read remote HTTP URLs.
         video_paths = []
+        _downloaded_temps = []  # track downloaded temp files for cleanup
+
         for url in video_urls:
-            if url.startswith('/media/'):
+            if url.startswith('http://') or url.startswith('https://'):
+                # Download S3/remote video to a local temp file
+                tmp_fd, tmp_path = _tempfile.mkstemp(suffix='.mp4')
+                os.close(tmp_fd)
+                logger.info(f"Downloading remote video: {url} -> {tmp_path}")
+                try:
+                    urllib.request.urlretrieve(url, tmp_path)
+                except Exception as dl_err:
+                    sv.status = 'error'
+                    sv.error_message = f'Failed to download video: {str(dl_err)}'
+                    sv.save()
+                    logger.error(f"Download failed for {url}: {dl_err}")
+                    for t in _downloaded_temps:
+                        try: os.remove(t)
+                        except: pass
+                    return
+                video_paths.append(tmp_path)
+                _downloaded_temps.append(tmp_path)
+            elif url.startswith('/media/'):
                 path = os.path.join(settings.BASE_DIR, url.lstrip('/'))
                 path = os.path.normpath(path)
                 video_paths.append(path)
-            elif url.startswith('http://') or url.startswith('https://'):
-                video_paths.append(url)
             else:
                 video_paths.append(os.path.normpath(url))
         
         # Verify all local files exist
         for p in video_paths:
-            if p.startswith('http://') or p.startswith('https://'):
-                continue
             if not os.path.exists(p):
                 sv.status = 'error'
                 sv.error_message = f'Video file not found: {os.path.basename(p)}'
                 sv.save()
                 logger.error(f"Video not found: {p}")
+                for t in _downloaded_temps:
+                    try: os.remove(t)
+                    except: pass
                 return
         
         import tempfile
@@ -210,6 +233,11 @@ def stitch_videos_task(stitched_video_id, transition='cut'):
             logger.error(f"FFmpeg stderr: {result.stderr}")
         
         sv.save()
+
+        # Cleanup any downloaded temp files
+        for t in _downloaded_temps:
+            try: os.remove(t)
+            except: pass
 
     except Exception as e:
         logger.error(f"Stitch error for {stitched_video_id}: {str(e)}")

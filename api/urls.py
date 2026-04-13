@@ -19,4 +19,7 @@ urlpatterns = [
     path('stitch/', views.StitchVideosView.as_view(), name='stitch_videos'),
     path('stitched/', views.StitchedVideoListView.as_view(), name='stitched_list'),
     path('stitched/<uuid:pk>/', views.StitchedVideoDetailView.as_view(), name='stitched_detail'),
+
+    # Temporary debug endpoint — verify S3 config on Render
+    path('debug/s3/', views.S3DebugView.as_view(), name='s3_debug'),
 ]
