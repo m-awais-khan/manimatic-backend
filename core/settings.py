@@ -143,10 +143,19 @@ if USE_S3:
         _supabase_project_id = AWS_S3_ENDPOINT_URL.split('//')[1].split('.')[0]
         AWS_S3_CUSTOM_DOMAIN = f'{_supabase_project_id}.supabase.co/storage/v1/object/public/{AWS_STORAGE_BUCKET_NAME}'
 
-    DEFAULT_FILE_STORAGE = 'storages.backends.s3boto3.S3Boto3Storage'
-
     MEDIA_URL = f'https://{AWS_S3_CUSTOM_DOMAIN}/'
     STATIC_URL = 'static/'
+
+    # Django 4.2+ replaced DEFAULT_FILE_STORAGE with the STORAGES dict.
+    # Django 6 silently ignores DEFAULT_FILE_STORAGE, so this is required.
+    STORAGES = {
+        "default": {
+            "BACKEND": "storages.backends.s3boto3.S3Boto3Storage",
+        },
+        "staticfiles": {
+            "BACKEND": "django.contrib.staticfiles.storage.StaticFilesStorage",
+        },
+    }
 else:
     STATIC_URL = 'static/'
     MEDIA_URL = '/media/'
