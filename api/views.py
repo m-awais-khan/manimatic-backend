@@ -12,8 +12,11 @@ import threading
 import requests
 import os
 import shutil
+import logging
 from .services.generator import generate_scene_task
 from .services.stitcher import stitch_videos_task
+
+logger = logging.getLogger(__name__)
 
 # ── S3 Debug View (temporary — remove in prod) ───────────────
 
@@ -32,6 +35,43 @@ class S3DebugView(APIView):
         })
 
 # ── Auth Views ──────────────────────────────────────────────
+
+def _delete_storage_file(video_path):
+    """
+    Delete a video from storage (works for both S3 and local filesystem).
+    Accepts either:
+      - A full S3/HTTPS URL: https://<project>.supabase.co/storage/v1/object/public/<bucket>/videos/scene_xyz.mp4
+      - A local media path:  /media/videos/scene_xyz.mp4
+    Extracts the relative storage key and calls default_storage.delete().
+    """
+    from django.core.files.storage import default_storage
+    from django.conf import settings as dj_settings
+
+    if not video_path:
+        return
+
+    try:
+        bucket = getattr(dj_settings, 'AWS_STORAGE_BUCKET_NAME', '')
+
+        if video_path.startswith('http://') or video_path.startswith('https://'):
+            # S3 URL — extract the key after /object/public/<bucket>/
+            # e.g. https://xxx.supabase.co/storage/v1/object/public/manimatic-media/videos/scene_abc.mp4
+            # → videos/scene_abc.mp4
+            marker = f'/object/public/{bucket}/'
+            if marker in video_path:
+                storage_key = video_path.split(marker, 1)[1]
+            else:
+                # Fallback: take everything after the last known prefix
+                storage_key = video_path.split('/')[-1]  # just the filename
+        else:
+            # Local path like /media/videos/scene_xyz.mp4 → videos/scene_xyz.mp4
+            storage_key = video_path.lstrip('/').removeprefix('media/').lstrip('/')
+
+        logger.info(f"Deleting storage key: {storage_key}")
+        default_storage.delete(storage_key)
+    except Exception as e:
+        logger.warning(f"Could not delete storage file '{video_path}': {e}")
+
 
 class GoogleAuthView(APIView):
     permission_classes = [AllowAny]
@@ -112,24 +152,16 @@ class UserProfileView(APIView):
         })
 
     def delete(self, request):
-        """Delete account and ALL associated data."""
+        """Delete account and ALL associated data including S3 files."""
         user = request.user
-        # Delete all user media files
+
+        # Delete all video files from storage (S3 or local)
         for chat in Chat.objects.filter(user=user):
             for scene in chat.scenes.all():
-                if scene.video_path:
-                    try:
-                        full_path = os.path.join(django_settings.BASE_DIR, scene.video_path.lstrip('/'))
-                        if os.path.exists(full_path):
-                            os.remove(full_path)
-                    except: pass
+                _delete_storage_file(scene.video_path)
+
         for sv in StitchedVideo.objects.filter(user=user):
-            if sv.video_path:
-                try:
-                    full_path = os.path.join(django_settings.BASE_DIR, sv.video_path.lstrip('/'))
-                    if os.path.exists(full_path):
-                        os.remove(full_path)
-                except: pass
+            _delete_storage_file(sv.video_path)
 
         user.delete()  # Cascades to Profile, Chats, Scenes, StitchedVideos
         return Response({'message': 'Account deleted'}, status=status.HTTP_204_NO_CONTENT)
@@ -141,25 +173,16 @@ class WipeDataView(APIView):
     def delete(self, request):
         """Wipe all user data but keep the account."""
         user = request.user
-        # Delete chats (cascades to scenes)
+
+        # Delete scene video files from storage
         for chat in Chat.objects.filter(user=user):
             for scene in chat.scenes.all():
-                if scene.video_path:
-                    try:
-                        full_path = os.path.join(django_settings.BASE_DIR, scene.video_path.lstrip('/'))
-                        if os.path.exists(full_path):
-                            os.remove(full_path)
-                    except: pass
+                _delete_storage_file(scene.video_path)
             chat.delete()
 
-        # Delete stitched videos
+        # Delete stitched video files from storage
         for sv in StitchedVideo.objects.filter(user=user):
-            if sv.video_path:
-                try:
-                    full_path = os.path.join(django_settings.BASE_DIR, sv.video_path.lstrip('/'))
-                    if os.path.exists(full_path):
-                        os.remove(full_path)
-                except: pass
+            _delete_storage_file(sv.video_path)
             sv.delete()
 
         return Response({'message': 'All data wiped'}, status=status.HTTP_204_NO_CONTENT)
