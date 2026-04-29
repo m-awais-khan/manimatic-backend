@@ -6,14 +6,23 @@ import tempfile as _tempfile
 from django.conf import settings
 import uuid
 import logging
+import re
 
 logger = logging.getLogger(__name__)
 
 TRANSITION_DURATION = 0.5  # seconds
 
+try:
+    import imageio_ffmpeg
+    FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
+except Exception as e:
+    logger.warning(f"imageio_ffmpeg not found, falling back to system ffmpeg: {e}")
+    FFMPEG_EXE = 'ffmpeg'
+
 
 def _get_video_duration(path):
     """Get video duration in seconds using ffprobe."""
+    # First try ffprobe
     cmd = [
         'ffprobe', '-v', 'quiet',
         '-print_format', 'json',
@@ -25,8 +34,18 @@ def _get_video_duration(path):
         if result.returncode == 0:
             data = json.loads(result.stdout)
             return float(data['format']['duration'])
+    except Exception:
+        pass
+        
+    # Fallback to parsing ffmpeg stderr
+    try:
+        res = subprocess.run([FFMPEG_EXE, '-i', path], capture_output=True, text=True, timeout=30)
+        match = re.search(r'Duration: (\d+):(\d+):(\d+\.\d+)', res.stderr)
+        if match:
+            return int(match.group(1)) * 3600 + int(match.group(2)) * 60 + float(match.group(3))
     except Exception as e:
-        logger.warning(f"Could not get duration for {path}: {e}")
+        logger.warning(f"Could not parse duration for {path} using ffmpeg: {e}")
+        
     return 5.0  # fallback
 
 
@@ -41,7 +60,7 @@ def _stitch_with_cut(video_paths, output_path):
             f.write(f"file '{escaped}'\n")
     
     cmd = [
-        'ffmpeg', '-y',
+        FFMPEG_EXE, '-y',
         '-f', 'concat', '-safe', '0',
         '-i', concat_file,
         '-c', 'copy',
@@ -119,7 +138,7 @@ def _stitch_with_transition(video_paths, output_path, transition_type):
         filter_complex = ";".join(filters)
     
     cmd = [
-        'ffmpeg', '-y',
+        FFMPEG_EXE, '-y',
         *input_args,
         '-filter_complex', filter_complex,
         '-map', '[outv]',
