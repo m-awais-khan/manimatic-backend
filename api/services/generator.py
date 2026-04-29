@@ -62,11 +62,19 @@ def generate_scene_task(scene_id, quality='720p'):
         return
 
     try:
-        # 1. Fetch Chat History
+        # 1. Fetch Chat History (Sliding Window)
         history = []
         if scene.chat:
-            past_scenes = Scene.objects.filter(chat=scene.chat, created_at__lt=scene.created_at).order_by('created_at')
-            for past_scene in past_scenes:
+            # Fetch last 5 scenes max to prevent context overflow (especially for local models)
+            recent_scenes = list(Scene.objects.filter(
+                chat=scene.chat, 
+                created_at__lt=scene.created_at
+            ).order_by('-created_at')[:5])
+            
+            # Reverse to restore chronological order
+            recent_scenes.reverse()
+
+            for past_scene in recent_scenes:
                 if past_scene.code and past_scene.status == 'completed':
                     history.append({
                         "role": "user",
