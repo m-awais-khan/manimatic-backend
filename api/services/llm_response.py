@@ -88,6 +88,33 @@ class MyScene(Scene):
                 temperature=0.1,
                 api_key=os.getenv("GEMINI_API_KEY")
             )
+    elif target_model.startswith('groq-'):
+        from langchain_openai import ChatOpenAI
+        model_name = target_model.replace('groq-', '')
+        groq_api_key = os.getenv("GROQ_API_KEY")
+        if not groq_api_key:
+            logger.error("GROQ_API_KEY not found. Falling back to Gemini.")
+            llm = ChatGoogleGenerativeAI(
+                model="gemini-2.5-flash",
+                temperature=0.1,
+                api_key=os.getenv("GEMINI_API_KEY")
+            )
+        else:
+            try:
+                llm = ChatOpenAI(
+                    model=model_name,
+                    temperature=0.1,
+                    api_key=groq_api_key,
+                    base_url="https://api.groq.com/openai/v1",
+                    max_tokens=2048
+                )
+            except Exception as e:
+                logger.error(f"Failed to initialize Groq model, falling back to Gemini. Error: {e}")
+                llm = ChatGoogleGenerativeAI(
+                    model="gemini-2.5-flash",
+                    temperature=0.1,
+                    api_key=os.getenv("GEMINI_API_KEY")
+                )
     else:
         # Initialize the LangChain Gemini model
         llm = ChatGoogleGenerativeAI(
