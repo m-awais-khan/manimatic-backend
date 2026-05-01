@@ -132,6 +132,12 @@ class MyScene(Scene):
         else:
             messages.append(AIMessage(content=msg["content"]))
             
+    # Enforce boundaries by injecting a strong reminder at the very end of the user's prompt.
+    # Models (especially custom/open-source ones) pay the most attention to the very last instructions.
+    boundary_reminder = "\n\n(CRITICAL REMINDER: Ensure ALL objects and text fit entirely inside the video frame. The safe X range is -6.5 to +6.5, and Y range is -3.5 to +3.5. You MUST use .scale_to_fit_width(12), .scale_to_fit_height(6), or .scale() on your main VGroups to guarantee nothing is cut off at the edges!)"
+    
+    final_prompt = prompt + boundary_reminder
+
     # Add the current prompt (Handles multimodal if image exists)
     if image_path and os.path.exists(image_path):
         import mimetypes
@@ -146,12 +152,12 @@ class MyScene(Scene):
         image_data = f"data:{mime_type};base64,{encoded_string}"
         
         message_content = [
-            {"type": "text", "text": prompt},
+            {"type": "text", "text": final_prompt},
             {"type": "image_url", "image_url": {"url": image_data}}
         ]
         messages.append(HumanMessage(content=message_content))
     else:
-        messages.append(HumanMessage(content=prompt))
+        messages.append(HumanMessage(content=final_prompt))
 
     response = llm.invoke(messages)
 
