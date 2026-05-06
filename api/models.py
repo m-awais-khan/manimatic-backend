@@ -12,6 +12,29 @@ class UserProfile(models.Model):
     def __str__(self):
         return f"{self.display_name} ({self.user.email})"
 
+class DataTrainingOptOut(models.Model):
+    """
+    Records users who have opted OUT of allowing their data
+    to be used for training Manimatic's custom AI model.
+
+    By default every user is opted IN (consented).  A row is created
+    here only when the user explicitly disables the toggle in Settings.
+    Deleting a row restores the user to the opted-in (consented) state.
+    """
+    user = models.OneToOneField(
+        User,
+        on_delete=models.CASCADE,
+        related_name='training_opt_out'
+    )
+    opted_out_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = 'Data Training Opt-Out'
+        verbose_name_plural = 'Data Training Opt-Outs'
+
+    def __str__(self):
+        return f"{self.user.email} — opted out at {self.opted_out_at:%Y-%m-%d %H:%M UTC}"
+
 class Chat(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='chats', null=True, blank=True)
@@ -73,3 +96,22 @@ class StitchedVideo(models.Model):
 
     def __str__(self):
         return f"Stitched {self.id} - {self.status}"
+
+from django.db.models.signals import post_delete
+from django.dispatch import receiver
+
+@receiver(post_delete, sender=Scene)
+def delete_scene_files(sender, instance, **kwargs):
+    """Automatically delete the associated video and reference image when a Scene is deleted."""
+    from api.views import _delete_storage_file
+    if instance.video_path:
+        _delete_storage_file(instance.video_path)
+    if instance.reference_image:
+        instance.reference_image.delete(save=False)
+
+@receiver(post_delete, sender=StitchedVideo)
+def delete_stitched_video_files(sender, instance, **kwargs):
+    """Automatically delete the associated video when a StitchedVideo is deleted."""
+    from api.views import _delete_storage_file
+    if instance.video_path:
+        _delete_storage_file(instance.video_path)

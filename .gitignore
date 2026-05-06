@@ -15,5 +15,6 @@ __pycache__/
 media/
 generated_videos/
 outputs/
+chroma_db/
 *.mp4
 *.mkv

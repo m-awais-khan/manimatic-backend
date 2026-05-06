@@ -106,6 +106,18 @@ def generate_scene_task(scene_id, quality='720p'):
         scene.status = 'rendering'
         scene.save()
 
+        # --- DEVELOPER LOGGER ---
+        print(f"\n\n{'=' * 80}")
+        print(f"🤖 AI GENERATION LOGGER - SCENE {scene_id} - MODEL: {scene.target_model}")
+        print(f"{'=' * 80}")
+        print(f"📝 USER PROMPT:\n{scene.prompt}\n")
+        if history:
+            print(f"📚 CONTEXT/HISTORY INCLUDED: {len(history)} messages")
+        print(f"{'-' * 80}")
+        print(f"💻 GENERATED CODE:\n\n{code}\n")
+        print(f"{'=' * 80}\n")
+        # ------------------------
+
         # 3. Agent Loop — Execute and self-heal on errors
         current_code = code
         last_error = None
@@ -159,6 +171,16 @@ def generate_scene_task(scene_id, quality='720p'):
                 scene.code = fixed_code
                 scene.status = 'rendering'
                 scene.save()
+
+                # --- DEVELOPER LOGGER (SELF-HEAL) ---
+                print(f"\n\n{'=' * 80}")
+                print(f"🛠️ SELF-HEALING LOGGER - SCENE {scene_id} - ATTEMPT {attempt}")
+                print(f"{'=' * 80}")
+                print(f"🐛 ERROR SENT TO LLM:\n{clean_error}\n")
+                print(f"{'-' * 80}")
+                print(f"💻 NEW FIXED CODE:\n\n{fixed_code}\n")
+                print(f"{'=' * 80}\n")
+                # ------------------------------------
 
         # All retries exhausted
         scene.status = 'error'

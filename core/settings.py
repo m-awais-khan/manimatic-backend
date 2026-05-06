@@ -164,6 +164,10 @@ else:
 
 CORS_ALLOW_ALL_ORIGINS = True # Allow all origins for dev
 
+from corsheaders.defaults import default_headers
+CORS_ALLOW_HEADERS = list(default_headers) + [
+    'ngrok-skip-browser-warning',
+]
 # REST Framework settings
 REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': [

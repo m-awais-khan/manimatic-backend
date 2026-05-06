@@ -1,7 +1,7 @@
 from backend.api import llm_client
 from config import MODEL_NAME
 import streamlit as st
-from backend.utils import get_fallback_code
+from api.services.utils import get_fallback_code
 
 # Initialize the OpenAI client
 client = llm_client.get_openai_client()

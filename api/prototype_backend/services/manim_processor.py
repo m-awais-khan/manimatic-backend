@@ -1,4 +1,4 @@
-from backend.utils import code_validator
+from api.services.utils import code_validator
 import tempfile
 import os
 import subprocess
@@ -56,23 +56,51 @@ def execute_manim_code(code, scene_id, quality="720p"):
             "--output_file", f"scene_{scene_id}"
         ]
 
-        # Run the command with better error handling
-        result = subprocess.run(
+        # --- DEVELOPER LOGGER (MANIM STREAMING) ---
+        print(f"\n{'=' * 80}")
+        print(f"🎬 MANIM COMPILER LOGS FOR SCENE {scene_id} ({quality})")
+        print(f"{'=' * 80}")
+        print(f"Command: {' '.join(cmd)}")
+        print(f"{'-' * 80}")
+
+        # Run the command with real-time streaming to the developer console
+        process = subprocess.Popen(
             cmd,
             cwd=temp_dir,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             text=True,
-            timeout=300,  # 5 minute timeout
             encoding='utf-8',
             errors='replace'
         )
 
-        if result.returncode == 0:
+        output_lines = []
+        try:
+            for line in process.stdout:
+                # Stream directly to Django console
+                print(line, end="")
+                output_lines.append(line)
+            
+            process.wait(timeout=300)
+            returncode = process.returncode
+            output_text = "".join(output_lines)
+
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+            print(f"\n❌ MANIM TIMEOUT FOR SCENE {scene_id}")
+            print(f"{'=' * 80}\n")
+            return None, "Manim execution timed out (5 minutes)."
+
+        print(f"{'=' * 80}\n")
+        # ------------------------------------------
+
+        if returncode == 0:
             # Locate the rendered video file
             media_dir = os.path.join(temp_dir, "media", "videos")
 
             if not os.path.exists(media_dir):
-                return None, f"No video file generated. Manim output: {result.stdout}"
+                return None, f"No video file generated. Manim output: {output_text}"
             for root, dirs, files in os.walk(media_dir):
                 for file in files:
                     if file.endswith(".mp4"):
@@ -88,8 +116,7 @@ def execute_manim_code(code, scene_id, quality="720p"):
 
                         return final_path, None
         else:
-            error_msg = result.stderr if result.stderr else result.stdout
-            return None, f"Manim execution failed: {error_msg}"
+            return None, f"Manim execution failed: {output_text}"
     except subprocess.TimeoutExpired:
         return None, "Manim execution timed out (5 minutes)."
     except Exception as e:

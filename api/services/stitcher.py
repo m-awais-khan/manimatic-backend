@@ -93,49 +93,56 @@ def _stitch_with_transition(video_paths, output_path, transition_type):
     input_args = []
     for path in video_paths:
         input_args.extend(['-i', path])
+        
+    filters = []
+    
+    # Scale and normalize all inputs to 1280x720, 30fps, yuv420p
+    # This prevents the "parameters do not match" error in xfade.
+    for i in range(n):
+        filters.append(
+            f"[{i}:v]scale=1280:720:force_original_aspect_ratio=decrease,"
+            f"pad=1280:720:(ow-iw)/2:(oh-ih)/2,fps=30,format=yuv420p[v{i}_norm]"
+        )
     
     if n == 2:
         # Simple case: just one xfade between two inputs
         offset = max(0, durations[0] - TRANSITION_DURATION)
-        filter_complex = (
-            f"[0:v][1:v]xfade=transition={transition_type}"
+        filters.append(
+            f"[v0_norm][v1_norm]xfade=transition={transition_type}"
             f":duration={TRANSITION_DURATION}:offset={offset}[outv]"
         )
     else:
         # Chain xfade filters for 3+ videos
-        filters = []
-        # Accumulated offset tracking
-        # After each xfade, the output is shorter by TRANSITION_DURATION
         accumulated_duration = durations[0]
         
-        # First xfade: [0:v] and [1:v]
+        # First xfade: [v0_norm] and [v1_norm]
         offset = max(0, accumulated_duration - TRANSITION_DURATION)
         filters.append(
-            f"[0:v][1:v]xfade=transition={transition_type}"
-            f":duration={TRANSITION_DURATION}:offset={offset}[v1]"
+            f"[v0_norm][v1_norm]xfade=transition={transition_type}"
+            f":duration={TRANSITION_DURATION}:offset={offset}[xf1]"
         )
         accumulated_duration = offset + durations[1]  # new total after xfade
         
         # Chain remaining videos
         for i in range(2, n):
-            prev_label = f"v{i-1}"
+            prev_label = f"xf{i-1}"
             offset = max(0, accumulated_duration - TRANSITION_DURATION)
             
             if i == n - 1:
                 # Last one outputs [outv]
                 filters.append(
-                    f"[{prev_label}][{i}:v]xfade=transition={transition_type}"
+                    f"[{prev_label}][v{i}_norm]xfade=transition={transition_type}"
                     f":duration={TRANSITION_DURATION}:offset={offset}[outv]"
                 )
             else:
-                out_label = f"v{i}"
+                out_label = f"xf{i}"
                 filters.append(
-                    f"[{prev_label}][{i}:v]xfade=transition={transition_type}"
+                    f"[{prev_label}][v{i}_norm]xfade=transition={transition_type}"
                     f":duration={TRANSITION_DURATION}:offset={offset}[{out_label}]"
                 )
             accumulated_duration = offset + durations[i]
-        
-        filter_complex = ";".join(filters)
+            
+    filter_complex = ";".join(filters)
     
     cmd = [
         FFMPEG_EXE, '-y',

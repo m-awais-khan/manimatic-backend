@@ -46,6 +46,7 @@ Text and Font Rules:
 - For labels, use font_size=24
 
 Layout Rules:
+- AVOID OVERLAPPING: Never overlap text or objects. Ensure sufficient spacing between all elements.
 - When placing multiple objects, use VGroup(...).arrange(DOWN, buff=0.5) to stack them neatly
 - When placing objects side by side, use VGroup(...).arrange(RIGHT, buff=0.5)
 - ALWAYS call .move_to(ORIGIN) or .center() on your main VGroup to ensure centering
@@ -159,6 +160,6 @@ class MyScene(Scene):
     else:
         messages.append(HumanMessage(content=final_prompt))
 
-    response = llm.invoke(messages)
+    response = llm.invoke(messages, config={"timeout": 180})
 
     return response.content

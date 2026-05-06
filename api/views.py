@@ -6,17 +6,51 @@ from rest_framework.authtoken.models import Token
 from django.shortcuts import get_object_or_404
 from django.contrib.auth.models import User
 from django.conf import settings as django_settings
-from .models import Scene, Chat, StitchedVideo, UserProfile
+from .models import Scene, Chat, StitchedVideo, UserProfile, DataTrainingOptOut
 from .serializers import SceneSerializer, ChatSerializer, StitchedVideoSerializer
 import threading
 import requests
 import os
 import shutil
 import logging
+import json
+import random
+from pathlib import Path
 from .services.generator import generate_scene_task
 from .services.stitcher import stitch_videos_task
+from .services.prompt_enhancer import enhance_prompt
+
 
 logger = logging.getLogger(__name__)
+
+# ── Dataset JSON loader (cached at module level) ──────────────
+
+_DATASET_CACHE = None
+
+def _load_dataset():
+    """
+    Load manim-dataset-viewer.json from the frontend/public directory.
+    Result is cached in the module-level _DATASET_CACHE so the file
+    is only read from disk once per server process.
+    """
+    global _DATASET_CACHE
+    if _DATASET_CACHE is None:
+        # BASE_DIR is the backend/ folder; the JSON sits one level up in frontend/public/
+        json_path = Path(django_settings.BASE_DIR).parent / 'frontend' / 'public' / 'manim-dataset-viewer.json'
+        try:
+            with open(json_path, 'r', encoding='utf-8') as f:
+                raw = json.load(f)
+            # The JSON root is either a list or { "examples": [...] }
+            if isinstance(raw, list):
+                _DATASET_CACHE = raw
+            else:
+                _DATASET_CACHE = raw.get('examples', [])
+            logger.info('Dataset loaded: %d entries', len(_DATASET_CACHE))
+        except Exception as e:
+            logger.error('Failed to load dataset JSON: %s', e)
+            _DATASET_CACHE = []
+    return _DATASET_CACHE
+
 
 # ── S3 Debug View (temporary — remove in prod) ───────────────
 
@@ -33,6 +67,140 @@ class S3DebugView(APIView):
             'endpoint': getattr(django_settings, 'AWS_S3_ENDPOINT_URL', 'N/A'),
             'media_url': django_settings.MEDIA_URL,
         })
+
+# ── Dataset Suggestions View ───────────────────────────────────
+
+class DatasetSuggestionsView(APIView):
+    """
+    GET /api/suggestions/?count=4
+    Returns `count` (default 4, max 5) random dataset entries whose
+    video file exists, for use as suggestion chips on the new-chat screen.
+    No authentication required.
+    """
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        try:
+            count = min(int(request.query_params.get('count', 4)), 5)
+        except (ValueError, TypeError):
+            count = 4
+
+        dataset = _load_dataset()
+        pool = [e for e in dataset if e.get('video_exists', False)]
+
+        if not pool:
+            return Response([], status=status.HTTP_200_OK)
+
+        picks = random.sample(pool, min(count, len(pool)))
+        results = [
+            {
+                'id': e['id'],
+                'instruction': e['instruction'],
+                'category': e.get('category', ''),
+                'complexity': e.get('complexity', ''),
+                'video_path': e['video_path'],
+            }
+            for e in picks
+        ]
+        return Response(results)
+
+
+# ── Dataset Scene (instant, no AI) ───────────────────────────
+
+class DatasetSceneView(APIView):
+    """
+    POST /api/scenes/from-dataset/
+    Body: { "dataset_id": "0016-bubblesortanimation" }
+
+    Creates a Chat + Scene record pre-populated from the dataset entry
+    (status=completed, code and video_path set immediately). The response
+    has the same shape as GenerateSceneView so the frontend can reuse the
+    exact same update logic.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        from django.core.files.storage import default_storage
+        from django.core.files.base import ContentFile
+
+        dataset_id = request.data.get('dataset_id', '').strip()
+        if not dataset_id:
+            return Response(
+                {'error': '"dataset_id" is required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        dataset = _load_dataset()
+        entry = next((e for e in dataset if e.get('id') == dataset_id), None)
+        if entry is None:
+            return Response(
+                {'error': f'Dataset entry "{dataset_id}" not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        instruction = entry['instruction']
+        code = entry.get('output', '')
+        dataset_video_path = entry['video_path']  # e.g. /dataset-videos/0016-bubblesortanimation.mp4
+
+        # Trim title to 60 chars for a clean sidebar label
+        title = (instruction[:57] + '...') if len(instruction) > 60 else instruction
+
+        # Create the chat first so we have an ID to name the video file
+        chat = Chat.objects.create(title=title, user=request.user)
+
+        # Create scene with a placeholder video_path — we'll update after copying
+        scene = Scene.objects.create(
+            chat=chat,
+            prompt=instruction,
+            code=code,
+            video_path=None,
+            status='completed',
+            target_model='dataset',
+        )
+
+        # ── Copy the dataset video into the user's own media storage ──────
+        # Source: frontend/public/dataset-videos/<filename>.mp4 (local disk)
+        video_filename = dataset_video_path.lstrip('/').split('/')[-1]  # e.g. 0016-bubblesortanimation.mp4
+        src_path = (
+            Path(django_settings.BASE_DIR).parent
+            / 'frontend' / 'public' / 'dataset-videos'
+            / video_filename
+        )
+        storage_key = f'videos/scene_{scene.id}.mp4'
+
+        try:
+            with open(src_path, 'rb') as f:
+                saved_name = default_storage.save(storage_key, ContentFile(f.read()))
+
+            # Works for both local (returns /media/...) and S3 (returns https://...)
+            stored_video_path = default_storage.url(saved_name)
+            scene.video_path = stored_video_path
+            scene.save(update_fields=['video_path'])
+            logger.info(
+                'Dataset video copied to storage: user=%s entry=%s stored_as=%s',
+                request.user.email, dataset_id, saved_name
+            )
+        except FileNotFoundError:
+            logger.error('Dataset video not found on disk: %s', src_path)
+            # Fall back to direct dataset path rather than leaving video_path null
+            scene.video_path = dataset_video_path
+            scene.save(update_fields=['video_path'])
+        except Exception as e:
+            logger.error('Failed to copy dataset video for scene %s: %s', scene.id, e)
+            scene.video_path = dataset_video_path
+            scene.save(update_fields=['video_path'])
+
+        serializer = SceneSerializer(scene)
+        logger.info(
+            'Dataset scene created: user=%s entry=%s scene=%s',
+            request.user.email, dataset_id, scene.id
+        )
+        return Response(
+            {'scene': serializer.data, 'chat_id': str(chat.id)},
+            status=status.HTTP_201_CREATED
+        )
+
+
 
 # ── Auth Views ──────────────────────────────────────────────
 
@@ -154,17 +322,51 @@ class UserProfileView(APIView):
     def delete(self, request):
         """Delete account and ALL associated data including S3 files."""
         user = request.user
-
-        # Delete all video files from storage (S3 or local)
-        for chat in Chat.objects.filter(user=user):
-            for scene in chat.scenes.all():
-                _delete_storage_file(scene.video_path)
-
-        for sv in StitchedVideo.objects.filter(user=user):
-            _delete_storage_file(sv.video_path)
-
-        user.delete()  # Cascades to Profile, Chats, Scenes, StitchedVideos
+        user.delete()  # Cascades to Profile, Chats, Scenes, StitchedVideos (and signals handle files)
         return Response({'message': 'Account deleted'}, status=status.HTTP_204_NO_CONTENT)
+
+
+class DataTrainingConsentView(APIView):
+    """
+    GET  /api/auth/training-consent/
+        Returns the current consent state for the authenticated user.
+        { "consented": true }   → user allows data to be used for training
+        { "consented": false }  → user has opted out
+
+    POST /api/auth/training-consent/
+        Body: { "consented": true | false }
+        Opt the user back in (deletes the opt-out row) or opt them out
+        (creates the opt-out row).  Idempotent.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        opted_out = DataTrainingOptOut.objects.filter(user=request.user).exists()
+        return Response({'consented': not opted_out})
+
+    def post(self, request):
+        consented = request.data.get('consented')
+        if consented is None:
+            return Response(
+                {'error': '"consented" field is required (true or false)'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        if consented:
+            # User is turning consent ON → remove their opt-out record if it exists
+            deleted_count, _ = DataTrainingOptOut.objects.filter(user=request.user).delete()
+            action = 'opted_in'
+        else:
+            # User is turning consent OFF → ensure an opt-out record exists
+            _, created = DataTrainingOptOut.objects.get_or_create(user=request.user)
+            action = 'opted_out_created' if created else 'opted_out_already'
+
+        logger.info(
+            'Training consent change: user=%s action=%s',
+            request.user.email,
+            action
+        )
+        return Response({'consented': bool(consented), 'action': action})
 
 
 class WipeDataView(APIView):
@@ -174,16 +376,13 @@ class WipeDataView(APIView):
         """Wipe all user data but keep the account."""
         user = request.user
 
-        # Delete scene video files from storage
-        for chat in Chat.objects.filter(user=user):
-            for scene in chat.scenes.all():
-                _delete_storage_file(scene.video_path)
-            chat.delete()
+        # Delete all chats (cascades to scenes, signals handle files)
+        Chat.objects.filter(user=user).delete()
 
-        # Delete stitched video files from storage
-        for sv in StitchedVideo.objects.filter(user=user):
-            _delete_storage_file(sv.video_path)
-            sv.delete()
+        # Delete all stitched videos (signals handle files)
+        StitchedVideo.objects.filter(user=user).delete()
+
+
 
         return Response({'message': 'All data wiped'}, status=status.HTTP_204_NO_CONTENT)
 
@@ -208,9 +407,7 @@ class ChatDetailView(APIView):
         
     def delete(self, request, pk):
         chat = get_object_or_404(Chat, pk=pk, user=request.user)
-        for scene in chat.scenes.all():
-            _delete_storage_file(scene.video_path)
-        chat.delete()
+        chat.delete() # Signals handle file deletion
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 class GenerateSceneView(APIView):
@@ -290,6 +487,51 @@ class StitchedVideoDetailView(APIView):
     
     def delete(self, request, pk):
         sv = get_object_or_404(StitchedVideo, pk=pk, user=request.user)
-        _delete_storage_file(sv.video_path)
-        sv.delete()
+        sv.delete() # Signals handle file deletion
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+
+
+
+# ── Prompt Enhancement ────────────────────────────────────────────────────────
+
+class PromptEnhanceView(APIView):
+    """
+    POST /api/enhance-prompt/
+    Body: { "prompt": "raw user text" }
+    Returns: { "enhanced_prompt": "structured prompt" }
+
+    Uses ChromaDB RAG + Groq (primary) / Gemini (fallback) to rephrase
+    the user's raw idea into the wording style of the Manimatic dataset.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        raw_prompt = request.data.get("prompt", "").strip()
+        if not raw_prompt:
+            return Response(
+                {"error": "Prompt is required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if len(raw_prompt) > 2000:
+            return Response(
+                {"error": "Prompt too long. Please keep it under 2000 characters."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            enhanced = enhance_prompt(raw_prompt)
+            return Response({"enhanced_prompt": enhanced})
+        except RuntimeError as e:
+            return Response(
+                {"error": str(e)},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        except Exception as e:
+            logger.error(f"Prompt enhancement unexpected error: {e}")
+            return Response(
+                {"error": "An unexpected error occurred during prompt enhancement."},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )

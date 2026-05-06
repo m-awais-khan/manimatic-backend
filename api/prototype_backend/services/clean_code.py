@@ -1,5 +1,5 @@
 import streamlit as st
-from backend.utils import get_fallback_code
+from api.services.utils import get_fallback_code
 
 
 def code_cleaner(code):
