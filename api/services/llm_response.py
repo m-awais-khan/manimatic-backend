@@ -59,7 +59,6 @@ def get_llm_response(prompt, history=None, image_path=None, target_model='gemini
             base_url=custom_url,
             max_tokens=2048
         )
-        # The error message explicitly asked for 'json_schema'
         try:
             structured_llm = llm.with_structured_output(ManimResponse, method="json_schema")
         except:
@@ -84,7 +83,7 @@ def get_llm_response(prompt, history=None, image_path=None, target_model='gemini
             except:
                 structured_llm = llm.with_structured_output(ManimResponse, method="json_mode")
     else:
-        # Default to Gemini 2.5 Flash for structured output support in 2026
+        # Default to Gemini 2.5 Flash
         llm = ChatGoogleGenerativeAI(
             model="gemini-2.5-flash",
             temperature=0.1,
@@ -99,7 +98,6 @@ def get_llm_response(prompt, history=None, image_path=None, target_model='gemini
         if msg["role"] == "user":
             messages.append(HumanMessage(content=msg["content"]))
         else:
-            # For history, we just pass the content. 
             messages.append(AIMessage(content=msg["content"]))
             
     # Add current prompt
@@ -127,7 +125,6 @@ def get_llm_response(prompt, history=None, image_path=None, target_model='gemini
         with open("llm_error.log", "a") as f:
             f.write(f"\n--- ERROR ---\n{error_info}\n")
         logger.error(f"Error getting structured response: {e}")
-        # Fallback to a user-friendly message
         return ManimResponse(
             is_animation=False,
             chat_response="I'm having trouble connecting to my animation engine right now. Please try again in a moment.",
