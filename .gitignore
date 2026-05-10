@@ -18,3 +18,7 @@ outputs/
 chroma_db/
 *.mp4
 *.mkv
+
+# Log files
+*.log
+llm_error.log
