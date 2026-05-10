@@ -8,6 +8,10 @@ urlpatterns = [
     path('auth/wipe/', views.WipeDataView.as_view(), name='wipe_data'),
     path('auth/training-consent/', views.DataTrainingConsentView.as_view(), name='training_consent'),
     
+    # Projects
+    path('projects/', views.ProjectListCreateView.as_view(), name='project_list'),
+    path('projects/<uuid:pk>/', views.ProjectDetailView.as_view(), name='project_detail'),
+
     # Chats
     path('chats/', views.ChatListView.as_view(), name='chat_list'),
     path('chats/<uuid:pk>/', views.ChatDetailView.as_view(), name='chat_detail'),
@@ -16,6 +20,11 @@ urlpatterns = [
     path('scenes/', views.GenerateSceneView.as_view(), name='generate_scene'),
     path('scenes/from-dataset/', views.DatasetSceneView.as_view(), name='dataset_scene'),
     path('scenes/<uuid:pk>/', views.SceneStatusView.as_view(), name='scene_status'),
+
+    # Visual Animation Playground
+    path('playground/render/', views.PlaygroundRenderView.as_view(), name='playground_render'),
+    path('playground/projects/', views.PlaygroundProjectListView.as_view(), name='playground_projects'),
+    path('playground/projects/<uuid:pk>/', views.PlaygroundProjectDetailView.as_view(), name='playground_project_detail'),
     
     # Dataset suggestions (no auth required)
     path('suggestions/', views.DatasetSuggestionsView.as_view(), name='dataset_suggestions'),

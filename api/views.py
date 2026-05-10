@@ -6,8 +6,8 @@ from rest_framework.authtoken.models import Token
 from django.shortcuts import get_object_or_404
 from django.contrib.auth.models import User
 from django.conf import settings as django_settings
-from .models import Scene, Chat, StitchedVideo, UserProfile, DataTrainingOptOut
-from .serializers import SceneSerializer, ChatSerializer, StitchedVideoSerializer
+from .models import Scene, Chat, StitchedVideo, UserProfile, DataTrainingOptOut, PlaygroundProject, Project
+from .serializers import SceneSerializer, ChatSerializer, StitchedVideoSerializer, PlaygroundProjectSerializer, ProjectSerializer
 import threading
 import requests
 import os
@@ -19,6 +19,10 @@ from pathlib import Path
 from .services.generator import generate_scene_task
 from .services.stitcher import stitch_videos_task
 from .services.prompt_enhancer import enhance_prompt
+from .services.playground.layout_pass import apply_layout_pass
+from .services.playground.manifest_validator import validate_manifest
+from .services.playground.python_compiler import compile_manifest_to_python
+from .services.playground.render_task import compile_and_render_task
 
 
 logger = logging.getLogger(__name__)
@@ -110,12 +114,7 @@ class DatasetSuggestionsView(APIView):
 class DatasetSceneView(APIView):
     """
     POST /api/scenes/from-dataset/
-    Body: { "dataset_id": "0016-bubblesortanimation" }
-
-    Creates a Chat + Scene record pre-populated from the dataset entry
-    (status=completed, code and video_path set immediately). The response
-    has the same shape as GenerateSceneView so the frontend can reuse the
-    exact same update logic.
+    Body: { "dataset_id": "0016-bubblesortanimation", "project_id": "uuid" }
     """
     permission_classes = [IsAuthenticated]
 
@@ -124,31 +123,27 @@ class DatasetSceneView(APIView):
         from django.core.files.base import ContentFile
 
         dataset_id = request.data.get('dataset_id', '').strip()
+        project_id = request.data.get('project_id')
+
         if not dataset_id:
-            return Response(
-                {'error': '"dataset_id" is required'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
+            return Response({'error': '"dataset_id" is required'}, status=status.HTTP_400_BAD_REQUEST)
+        if not project_id:
+            return Response({'error': '"project_id" is required'}, status=status.HTTP_400_BAD_REQUEST)
+
+        project = get_object_or_404(Project, id=project_id, user=request.user)
 
         dataset = _load_dataset()
         entry = next((e for e in dataset if e.get('id') == dataset_id), None)
         if entry is None:
-            return Response(
-                {'error': f'Dataset entry "{dataset_id}" not found'},
-                status=status.HTTP_404_NOT_FOUND
-            )
+            return Response({'error': f'Dataset entry "{dataset_id}" not found'}, status=status.HTTP_404_NOT_FOUND)
 
         instruction = entry['instruction']
         code = entry.get('output', '')
-        dataset_video_path = entry['video_path']  # e.g. /dataset-videos/0016-bubblesortanimation.mp4
+        dataset_video_path = entry['video_path']
 
-        # Trim title to 60 chars for a clean sidebar label
         title = (instruction[:57] + '...') if len(instruction) > 60 else instruction
+        chat = Chat.objects.create(title=title, user=request.user, project=project)
 
-        # Create the chat first so we have an ID to name the video file
-        chat = Chat.objects.create(title=title, user=request.user)
-
-        # Create scene with a placeholder video_path — we'll update after copying
         scene = Scene.objects.create(
             chat=chat,
             prompt=instruction,
@@ -158,60 +153,67 @@ class DatasetSceneView(APIView):
             target_model='dataset',
         )
 
-        # ── Copy the dataset video into the user's own media storage ──────
-        # Source: frontend/public/dataset-videos/<filename>.mp4 (local disk)
-        video_filename = dataset_video_path.lstrip('/').split('/')[-1]  # e.g. 0016-bubblesortanimation.mp4
-        src_path = (
-            Path(django_settings.BASE_DIR).parent
-            / 'frontend' / 'public' / 'dataset-videos'
-            / video_filename
-        )
+        video_filename = dataset_video_path.lstrip('/').split('/')[-1]
+        src_path = Path(django_settings.BASE_DIR).parent / 'frontend' / 'public' / 'dataset-videos' / video_filename
         storage_key = f'videos/scene_{scene.id}.mp4'
 
         try:
             with open(src_path, 'rb') as f:
                 saved_name = default_storage.save(storage_key, ContentFile(f.read()))
-
-            # Works for both local (returns /media/...) and S3 (returns https://...)
             stored_video_path = default_storage.url(saved_name)
             scene.video_path = stored_video_path
             scene.save(update_fields=['video_path'])
-            logger.info(
-                'Dataset video copied to storage: user=%s entry=%s stored_as=%s',
-                request.user.email, dataset_id, saved_name
-            )
-        except FileNotFoundError:
-            logger.error('Dataset video not found on disk: %s', src_path)
-            # Fall back to direct dataset path rather than leaving video_path null
-            scene.video_path = dataset_video_path
-            scene.save(update_fields=['video_path'])
         except Exception as e:
-            logger.error('Failed to copy dataset video for scene %s: %s', scene.id, e)
+            logger.error('Failed to copy dataset video: %s', e)
             scene.video_path = dataset_video_path
             scene.save(update_fields=['video_path'])
 
-        serializer = SceneSerializer(scene)
-        logger.info(
-            'Dataset scene created: user=%s entry=%s scene=%s',
-            request.user.email, dataset_id, scene.id
-        )
-        return Response(
-            {'scene': serializer.data, 'chat_id': str(chat.id)},
-            status=status.HTTP_201_CREATED
-        )
+        return Response({'scene': SceneSerializer(scene).data, 'chat_id': str(chat.id)}, status=status.HTTP_201_CREATED)
 
+
+
+# ── Project Views ───────────────────────────────────────────
+
+class ProjectListCreateView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        projects = Project.objects.filter(user=request.user).order_by('-updated_at')
+        serializer = ProjectSerializer(projects, many=True)
+        return Response(serializer.data)
+
+    def post(self, request):
+        serializer = ProjectSerializer(data=request.data)
+        if serializer.is_valid():
+            serializer.save(user=request.user)
+            return Response(serializer.data, status=status.HTTP_201_CREATED)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+class ProjectDetailView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, pk):
+        project = get_object_or_404(Project, pk=pk, user=request.user)
+        serializer = ProjectSerializer(project)
+        return Response(serializer.data)
+
+    def put(self, request, pk):
+        project = get_object_or_404(Project, pk=pk, user=request.user)
+        serializer = ProjectSerializer(project, data=request.data, partial=True)
+        if serializer.is_valid():
+            serializer.save()
+            return Response(serializer.data)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+    def delete(self, request, pk):
+        project = get_object_or_404(Project, pk=pk, user=request.user)
+        project.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 # ── Auth Views ──────────────────────────────────────────────
 
 def _delete_storage_file(video_path):
-    """
-    Delete a video from storage (works for both S3 and local filesystem).
-    Accepts either:
-      - A full S3/HTTPS URL: https://<project>.supabase.co/storage/v1/object/public/<bucket>/videos/scene_xyz.mp4
-      - A local media path:  /media/videos/scene_xyz.mp4
-    Extracts the relative storage key and calls default_storage.delete().
-    """
     from django.core.files.storage import default_storage
     from django.conf import settings as dj_settings
 
@@ -220,22 +222,11 @@ def _delete_storage_file(video_path):
 
     try:
         bucket = getattr(dj_settings, 'AWS_STORAGE_BUCKET_NAME', '')
-
         if video_path.startswith('http://') or video_path.startswith('https://'):
-            # S3 URL — extract the key after /object/public/<bucket>/
-            # e.g. https://xxx.supabase.co/storage/v1/object/public/manimatic-media/videos/scene_abc.mp4
-            # → videos/scene_abc.mp4
             marker = f'/object/public/{bucket}/'
-            if marker in video_path:
-                storage_key = video_path.split(marker, 1)[1]
-            else:
-                # Fallback: take everything after the last known prefix
-                storage_key = video_path.split('/')[-1]  # just the filename
+            storage_key = video_path.split(marker, 1)[1] if marker in video_path else video_path.split('/')[-1]
         else:
-            # Local path like /media/videos/scene_xyz.mp4 → videos/scene_xyz.mp4
             storage_key = video_path.lstrip('/').removeprefix('media/').lstrip('/')
-
-        logger.info(f"Deleting storage key: {storage_key}")
         default_storage.delete(storage_key)
     except Exception as e:
         logger.warning(f"Could not delete storage file '{video_path}': {e}")
@@ -249,58 +240,31 @@ class GoogleAuthView(APIView):
         if not id_token:
             return Response({'error': 'id_token is required'}, status=status.HTTP_400_BAD_REQUEST)
 
-        # Verify token with Google
         try:
-            resp = requests.get(
-                f'https://oauth2.googleapis.com/tokeninfo?id_token={id_token}',
-                timeout=10
-            )
+            resp = requests.get(f'https://oauth2.googleapis.com/tokeninfo?id_token={id_token}', timeout=10)
             if resp.status_code != 200:
                 return Response({'error': 'Invalid token'}, status=status.HTTP_401_UNAUTHORIZED)
-
             google_data = resp.json()
-
-            # Verify audience matches our client ID
             if google_data.get('aud') != django_settings.GOOGLE_CLIENT_ID:
                 return Response({'error': 'Token audience mismatch'}, status=status.HTTP_401_UNAUTHORIZED)
-
-            google_id = google_data.get('sub')
-            email = google_data.get('email', '')
-            name = google_data.get('name', email.split('@')[0])
-            picture = google_data.get('picture', '')
-
+            google_id, email = google_data.get('sub'), google_data.get('email', '')
+            name, picture = google_data.get('name', email.split('@')[0]), google_data.get('picture', '')
         except Exception as e:
             return Response({'error': f'Token verification failed: {str(e)}'}, status=status.HTTP_401_UNAUTHORIZED)
 
-        # Find or create user
         try:
             profile = UserProfile.objects.get(google_id=google_id)
             user = profile.user
-            # Update profile info (might have changed)
-            profile.display_name = name
-            profile.profile_picture = picture
+            profile.display_name, profile.profile_picture = name, picture
             profile.save()
         except UserProfile.DoesNotExist:
-            # Create new user
-            username = f'google_{google_id}'
-            user = User.objects.create_user(username=username, email=email)
-            profile = UserProfile.objects.create(
-                user=user,
-                google_id=google_id,
-                display_name=name,
-                profile_picture=picture
-            )
+            user = User.objects.create_user(username=f'google_{google_id}', email=email)
+            profile = UserProfile.objects.create(user=user, google_id=google_id, display_name=name, profile_picture=picture)
 
-        # Get or create token
         token, _ = Token.objects.get_or_create(user=user)
-
         return Response({
             'token': token.key,
-            'profile': {
-                'email': user.email,
-                'display_name': profile.display_name,
-                'profile_picture': profile.profile_picture,
-            }
+            'profile': {'email': user.email, 'display_name': profile.display_name, 'profile_picture': profile.profile_picture}
         })
 
 
@@ -308,36 +272,15 @@ class UserProfileView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        try:
-            profile = request.user.profile
-        except UserProfile.DoesNotExist:
-            return Response({'error': 'Profile not found'}, status=status.HTTP_404_NOT_FOUND)
-
-        return Response({
-            'email': request.user.email,
-            'display_name': profile.display_name,
-            'profile_picture': profile.profile_picture,
-        })
+        profile = get_object_or_404(UserProfile, user=request.user)
+        return Response({'email': request.user.email, 'display_name': profile.display_name, 'profile_picture': profile.profile_picture})
 
     def delete(self, request):
-        """Delete account and ALL associated data including S3 files."""
-        user = request.user
-        user.delete()  # Cascades to Profile, Chats, Scenes, StitchedVideos (and signals handle files)
+        request.user.delete()
         return Response({'message': 'Account deleted'}, status=status.HTTP_204_NO_CONTENT)
 
 
 class DataTrainingConsentView(APIView):
-    """
-    GET  /api/auth/training-consent/
-        Returns the current consent state for the authenticated user.
-        { "consented": true }   → user allows data to be used for training
-        { "consented": false }  → user has opted out
-
-    POST /api/auth/training-consent/
-        Body: { "consented": true | false }
-        Opt the user back in (deletes the opt-out row) or opt them out
-        (creates the opt-out row).  Idempotent.
-    """
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
@@ -347,67 +290,46 @@ class DataTrainingConsentView(APIView):
     def post(self, request):
         consented = request.data.get('consented')
         if consented is None:
-            return Response(
-                {'error': '"consented" field is required (true or false)'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
+            return Response({'error': '"consented" field is required'}, status=status.HTTP_400_BAD_REQUEST)
         if consented:
-            # User is turning consent ON → remove their opt-out record if it exists
-            deleted_count, _ = DataTrainingOptOut.objects.filter(user=request.user).delete()
-            action = 'opted_in'
+            DataTrainingOptOut.objects.filter(user=request.user).delete()
         else:
-            # User is turning consent OFF → ensure an opt-out record exists
-            _, created = DataTrainingOptOut.objects.get_or_create(user=request.user)
-            action = 'opted_out_created' if created else 'opted_out_already'
-
-        logger.info(
-            'Training consent change: user=%s action=%s',
-            request.user.email,
-            action
-        )
-        return Response({'consented': bool(consented), 'action': action})
+            DataTrainingOptOut.objects.get_or_create(user=request.user)
+        return Response({'consented': bool(consented)})
 
 
 class WipeDataView(APIView):
     permission_classes = [IsAuthenticated]
 
     def delete(self, request):
-        """Wipe all user data but keep the account."""
-        user = request.user
-
-        # Delete all chats (cascades to scenes, signals handle files)
-        Chat.objects.filter(user=user).delete()
-
-        # Delete all stitched videos (signals handle files)
-        StitchedVideo.objects.filter(user=user).delete()
-
-
-
+        Project.objects.filter(user=request.user).delete()
+        Chat.objects.filter(user=request.user).delete()
+        PlaygroundProject.objects.filter(user=request.user).delete()
+        StitchedVideo.objects.filter(user=request.user).delete()
         return Response({'message': 'All data wiped'}, status=status.HTTP_204_NO_CONTENT)
 
 
-# ── Chat Views (user-scoped) ───────────────────────────────
+# ── Chat Views (project-scoped) ───────────────────────────────
 
 class ChatListView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        chats = Chat.objects.filter(user=request.user).order_by('-updated_at')
-        serializer = ChatSerializer(chats, many=True)
-        return Response(serializer.data)
+        project_id = request.query_params.get('project_id')
+        if not project_id:
+            return Response({'error': 'project_id required'}, status=status.HTTP_400_BAD_REQUEST)
+        chats = Chat.objects.filter(user=request.user, project_id=project_id).order_by('-updated_at')
+        return Response(ChatSerializer(chats, many=True).data)
 
 class ChatDetailView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request, pk):
         chat = get_object_or_404(Chat, pk=pk, user=request.user)
-        serializer = ChatSerializer(chat)
-        return Response(serializer.data)
+        return Response(ChatSerializer(chat).data)
         
     def delete(self, request, pk):
-        chat = get_object_or_404(Chat, pk=pk, user=request.user)
-        chat.delete() # Signals handle file deletion
+        get_object_or_404(Chat, pk=pk, user=request.user).delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 class GenerateSceneView(APIView):
@@ -415,18 +337,20 @@ class GenerateSceneView(APIView):
 
     def post(self, request):
         chat_id = request.data.get('chat_id')
+        project_id = request.data.get('project_id')
         prompt = request.data.get('prompt', '')
         
         if chat_id:
             chat = get_object_or_404(Chat, id=chat_id, user=request.user)
         else:
+            if not project_id:
+                return Response({'error': 'project_id required to start new chat'}, status=status.HTTP_400_BAD_REQUEST)
+            project = get_object_or_404(Project, id=project_id, user=request.user)
             title = prompt[:30] + '...' if len(prompt) > 30 else prompt
-            chat = Chat.objects.create(title=title, user=request.user)
+            chat = Chat.objects.create(title=title, user=request.user, project=project)
 
         data = request.data.copy()
-        
-        if chat:
-            data['chat'] = chat.id
+        data['chat'] = chat.id
 
         serializer = SceneSerializer(data=data)
         if serializer.is_valid():
@@ -436,102 +360,151 @@ class GenerateSceneView(APIView):
             return Response({'scene': serializer.data, 'chat_id': chat.id}, status=status.HTTP_202_ACCEPTED)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
+
+class PlaygroundRenderView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        raw_manifest = request.data.get('manifest')
+        if not isinstance(raw_manifest, dict):
+            return Response({'error': '"manifest" is required'}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            validated = validate_manifest(raw_manifest).model_dump()
+            manifest = apply_layout_pass(validated)
+            compiled_python = compile_manifest_to_python(manifest)
+        except Exception as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        chat_id = request.data.get('chat_id')
+        project_id = request.data.get('project_id')
+        title = (request.data.get('title') or 'Playground Scene').strip()[:255]
+        playground_id = request.data.get('playground_id')
+        chat = None
+        
+        if chat_id:
+            chat = get_object_or_404(Chat, id=chat_id, user=request.user)
+        else:
+            if playground_id:
+                try:
+                    pg = PlaygroundProject.objects.get(id=playground_id, user=request.user)
+                    if pg.last_scene and pg.last_scene.chat:
+                        chat = pg.last_scene.chat
+                except PlaygroundProject.DoesNotExist:
+                    pass
+
+        if not chat:
+            if not project_id:
+                return Response({'error': 'project_id required'}, status=status.HTTP_400_BAD_REQUEST)
+            project = get_object_or_404(Project, id=project_id, user=request.user)
+            chat = Chat.objects.create(title=title[:60] or 'Playground Scene', user=request.user, project=project)
+
+        scene = Scene.objects.create(chat=chat, prompt=title, code=compiled_python, manifest=manifest, source='playground', target_model='deterministic-playground', status='pending')
+
+        playground_id = request.data.get('playground_id')
+        if playground_id:
+            pg = get_object_or_404(PlaygroundProject, id=playground_id, user=request.user)
+            pg.manifest, pg.compiled_python, pg.last_scene = manifest, compiled_python, scene
+            pg.save()
+
+        quality = request.data.get('quality', '720p')
+        threading.Thread(target=compile_and_render_task, args=(scene.id, quality)).start()
+        return Response({'scene': SceneSerializer(scene).data, 'chat_id': str(chat.id), 'compiled_python': compiled_python, 'manifest': manifest}, status=status.HTTP_202_ACCEPTED)
+
+
+class PlaygroundProjectListView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        project_id = request.query_params.get('project_id')
+        if not project_id:
+            return Response({'error': 'project_id required'}, status=status.HTTP_400_BAD_REQUEST)
+        sessions = PlaygroundProject.objects.filter(user=request.user, project_id=project_id)
+        return Response(PlaygroundProjectSerializer(sessions, many=True).data)
+
+    def post(self, request):
+        project_id = request.data.get('project_id')
+        if not project_id:
+            return Response({'error': 'project_id required'}, status=status.HTTP_400_BAD_REQUEST)
+        project = get_object_or_404(Project, id=project_id, user=request.user)
+        
+        title = (request.data.get('title') or 'Untitled Playground').strip()[:255]
+        pg = PlaygroundProject.objects.create(user=request.user, project=project, title=title, graph_data=request.data.get('graph_data', {}))
+        return Response(PlaygroundProjectSerializer(pg).data, status=status.HTTP_201_CREATED)
+
+
+class PlaygroundProjectDetailView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, pk):
+        pg = get_object_or_404(PlaygroundProject, pk=pk, user=request.user)
+        return Response(PlaygroundProjectSerializer(pg).data)
+
+    def put(self, request, pk):
+        pg = get_object_or_404(PlaygroundProject, pk=pk, user=request.user)
+        pg.title = (request.data.get('title') or pg.title).strip()[:255]
+        pg.graph_data = request.data.get('graph_data', pg.graph_data)
+        pg.save()
+        return Response(PlaygroundProjectSerializer(pg).data)
+
+    def delete(self, request, pk):
+        get_object_or_404(PlaygroundProject, pk=pk, user=request.user).delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
 class SceneStatusView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request, pk):
         scene = get_object_or_404(Scene, pk=pk)
-        serializer = SceneSerializer(scene)
-        return Response(serializer.data)
-
-# ── Stitcher Views (user-scoped) ───────────────────────────
+        return Response(SceneSerializer(scene).data)
 
 class StitchVideosView(APIView):
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
-        video_paths = request.data.get('video_paths', [])
-        title = request.data.get('title', 'Stitched Video')
-        transition = request.data.get('transition', 'cut')
+        project_id = request.data.get('project_id')
+        if not project_id:
+            return Response({'error': 'project_id required'}, status=status.HTTP_400_BAD_REQUEST)
+        project = get_object_or_404(Project, id=project_id, user=request.user)
         
+        video_paths, title = request.data.get('video_paths', []), request.data.get('title', 'Stitched Video')
         if not video_paths or len(video_paths) < 2:
-            return Response({'error': 'Need at least 2 videos to stitch.'}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({'error': 'Need 2+ videos.'}, status=status.HTTP_400_BAD_REQUEST)
         
-        sv = StitchedVideo.objects.create(
-            title=title,
-            source_video_paths=video_paths,
-            status='pending',
-            user=request.user
-        )
-        
-        threading.Thread(target=stitch_videos_task, args=(sv.id, transition)).start()
-        
-        serializer = StitchedVideoSerializer(sv)
-        return Response(serializer.data, status=status.HTTP_202_ACCEPTED)
+        sv = StitchedVideo.objects.create(title=title, source_video_paths=video_paths, status='pending', user=request.user, project=project)
+        threading.Thread(target=stitch_videos_task, args=(sv.id, request.data.get('transition', 'cut'))).start()
+        return Response(StitchedVideoSerializer(sv).data, status=status.HTTP_202_ACCEPTED)
 
 class StitchedVideoListView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        videos = StitchedVideo.objects.filter(user=request.user).order_by('-created_at')
-        serializer = StitchedVideoSerializer(videos, many=True)
-        return Response(serializer.data)
+        project_id = request.query_params.get('project_id')
+        if not project_id:
+            return Response({'error': 'project_id required'}, status=status.HTTP_400_BAD_REQUEST)
+        videos = StitchedVideo.objects.filter(user=request.user, project_id=project_id).order_by('-created_at')
+        return Response(StitchedVideoSerializer(videos, many=True).data)
 
 class StitchedVideoDetailView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request, pk):
         sv = get_object_or_404(StitchedVideo, pk=pk, user=request.user)
-        serializer = StitchedVideoSerializer(sv)
-        return Response(serializer.data)
+        return Response(StitchedVideoSerializer(sv).data)
     
     def delete(self, request, pk):
-        sv = get_object_or_404(StitchedVideo, pk=pk, user=request.user)
-        sv.delete() # Signals handle file deletion
+        get_object_or_404(StitchedVideo, pk=pk, user=request.user).delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
-
-
-
-
-# ── Prompt Enhancement ────────────────────────────────────────────────────────
-
 class PromptEnhanceView(APIView):
-    """
-    POST /api/enhance-prompt/
-    Body: { "prompt": "raw user text" }
-    Returns: { "enhanced_prompt": "structured prompt" }
-
-    Uses ChromaDB RAG + Groq (primary) / Gemini (fallback) to rephrase
-    the user's raw idea into the wording style of the Manimatic dataset.
-    """
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
         raw_prompt = request.data.get("prompt", "").strip()
         if not raw_prompt:
-            return Response(
-                {"error": "Prompt is required."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        if len(raw_prompt) > 2000:
-            return Response(
-                {"error": "Prompt too long. Please keep it under 2000 characters."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
+            return Response({"error": "Prompt is required."}, status=status.HTTP_400_BAD_REQUEST)
         try:
             enhanced = enhance_prompt(raw_prompt)
             return Response({"enhanced_prompt": enhanced})
-        except RuntimeError as e:
-            return Response(
-                {"error": str(e)},
-                status=status.HTTP_503_SERVICE_UNAVAILABLE,
-            )
         except Exception as e:
-            logger.error(f"Prompt enhancement unexpected error: {e}")
-            return Response(
-                {"error": "An unexpected error occurred during prompt enhancement."},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            )
+            return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)

@@ -3,7 +3,9 @@ from __future__ import annotations
 
 from typing import Any, List, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+from .snippets import SNIPPET_REGISTRY
 
 
 class FrameSpec(BaseModel):
@@ -45,7 +47,55 @@ class AnimationManifest(BaseModel):
         ids = [m.id for m in v]
         if len(ids) != len(set(ids)):
             raise ValueError("Duplicate mobject id in manifest")
+        for mo in v:
+            if mo.type not in SNIPPET_REGISTRY:
+                raise ValueError(f"Unknown mobject type: {mo.type}")
         return v
+
+    @model_validator(mode="after")
+    def validate_timeline(self) -> "AnimationManifest":
+        ids = {m.id for m in self.mobjects}
+        allowed_kinds = {"animation", "wait", "parallel", "sequential"}
+
+        def check_step(step: dict[str, Any], path: str) -> None:
+            kind = step.get("kind")
+            if kind not in allowed_kinds:
+                raise ValueError(f"{path}: unknown timeline kind {kind!r}")
+            if kind == "wait":
+                duration = float(step.get("duration", 1.0))
+                if duration < 0:
+                    raise ValueError(f"{path}: wait duration must be non-negative")
+                return
+            if kind in {"parallel", "sequential"}:
+                children = step.get("children") or []
+                if not isinstance(children, list):
+                    raise ValueError(f"{path}: children must be a list")
+                for i, child in enumerate(children):
+                    check_step(child, f"{path}.children[{i}]")
+                return
+
+            atype = step.get("type")
+            # "None" is a valid sentinel meaning "no animation" — skip all further checks
+            if atype == "None":
+                return
+            spec = SNIPPET_REGISTRY.get(str(atype))
+            if not spec or "play" not in spec:
+                raise ValueError(f"{path}: unknown animation type {atype!r}")
+            required = int(spec.get("target_count", 1))
+            targets = list(step.get("targets") or [])
+            if required > 0:
+                if len(targets) < required:
+                    raise ValueError(f"{path}: {atype} requires {required} target(s)")
+                missing = [t for t in targets if t not in ids]
+                if missing:
+                    raise ValueError(f"{path}: target id(s) not found: {', '.join(missing)}")
+                if float(step.get("run_time", 1.0)) <= 0:
+                    raise ValueError(f"{path}: run_time must be positive")
+
+
+        for i, step in enumerate(self.timeline):
+            check_step(step, f"timeline[{i}]")
+        return self
 
 
 def validate_manifest(data: dict) -> AnimationManifest:

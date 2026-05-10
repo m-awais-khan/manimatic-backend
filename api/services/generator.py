@@ -91,17 +91,18 @@ def generate_scene_task(scene_id, quality='720p'):
         
         image_path = scene.reference_image.path if scene.reference_image else None
         
-        raw_output = get_llm_response(prompt=scene.prompt, history=history, image_path=image_path, target_model=scene.target_model)
+        # get_llm_response now returns a ManimResponse object
+        structured_res = get_llm_response(prompt=scene.prompt, history=history, image_path=image_path, target_model=scene.target_model)
         
-        # Check if conversational text response
-        if raw_output.strip().startswith("[TEXT]"):
-            text_reply = raw_output.replace("[TEXT]", "").strip()
-            scene.text_response = text_reply
+        if not structured_res.is_animation or not structured_res.code:
+            scene.text_response = structured_res.chat_response
             scene.status = 'completed'
             scene.save()
             return
 
-        code = clean_code(raw_output)
+        # If it is an animation, we don't want any text_response (no explanation)
+        scene.text_response = None
+        code = clean_code(structured_res.code)
         scene.code = code
         scene.status = 'rendering'
         scene.save()
@@ -125,6 +126,10 @@ def generate_scene_task(scene_id, quality='720p'):
         for attempt in range(1, MAX_RETRIES + 1):
             logger.info(f"Scene {scene_id}: Execution attempt {attempt}/{MAX_RETRIES}")
             
+            # Update attempt metadata
+            scene.manifest = {"attempt": attempt}
+            scene.save()
+            
             video_url, error = execute_manim_code(current_code, str(scene_id), quality=quality)
 
             if not error:
@@ -132,6 +137,7 @@ def generate_scene_task(scene_id, quality='720p'):
                 scene.status = 'completed'
                 scene.video_path = video_url
                 scene.code = current_code
+                scene.error_message = None # Clear any past errors
                 scene.save()
                 logger.info(f"Scene {scene_id}: Completed on attempt {attempt}")
                 return
@@ -140,6 +146,10 @@ def generate_scene_task(scene_id, quality='720p'):
             last_error = error
             clean_error = _extract_error_summary(error)
             logger.warning(f"Scene {scene_id}: Attempt {attempt} failed — {clean_error}")
+
+            # Store the current error so frontend can see it
+            scene.error_message = f"Attempt {attempt} failed: {clean_error}"
+            scene.save()
 
             if attempt < MAX_RETRIES:
                 # Feed error back to LLM for self-correction
@@ -150,8 +160,7 @@ def generate_scene_task(scene_id, quality='720p'):
                     f"The code you generated has an error when executed by Manim.\n\n"
                     f"ERROR: {clean_error}\n\n"
                     f"Here is the failing code:\n```python\n{current_code}\n```\n\n"
-                    f"Fix this error and return the complete corrected code. "
-                    f"Return ONLY the fixed Python code, no explanations."
+                    f"Fix this error and return the complete corrected code."
                 )
 
                 # Build history with the failed attempt
@@ -159,16 +168,16 @@ def generate_scene_task(scene_id, quality='720p'):
                 retry_history.append({"role": "user", "content": scene.prompt})
                 retry_history.append({"role": "model", "content": current_code})
 
-                raw_fix = get_llm_response(prompt=fix_prompt, history=retry_history, target_model=scene.target_model)
+                structured_fix = get_llm_response(prompt=fix_prompt, history=retry_history, target_model=scene.target_model)
                 
-                # Check if LLM returned text instead of code
-                if raw_fix.strip().startswith("[TEXT]"):
-                    logger.warning(f"Scene {scene_id}: LLM returned text on retry, breaking loop")
+                if not structured_fix.is_animation or not structured_fix.code:
+                    logger.warning(f"Scene {scene_id}: LLM returned no code on retry, breaking loop")
                     break
                 
-                fixed_code = clean_code(raw_fix)
+                fixed_code = clean_code(structured_fix.code)
                 current_code = fixed_code
                 scene.code = fixed_code
+                scene.text_response = None # No explanation
                 scene.status = 'rendering'
                 scene.save()
 
