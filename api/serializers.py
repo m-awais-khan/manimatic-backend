@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from .models import Scene, Chat, StitchedVideo, UserProfile, PlaygroundProject, Project
+from .models import Scene, Chat, StitchedVideo, UserProfile, PlaygroundProject, Project, VideoEditorProject
 
 class ProjectSerializer(serializers.ModelSerializer):
     class Meta:
@@ -41,6 +41,12 @@ class PlaygroundProjectSerializer(serializers.ModelSerializer):
             'updated_at',
         ]
         read_only_fields = ('id', 'last_scene', 'created_at', 'updated_at')
+
+class VideoEditorProjectSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = VideoEditorProject
+        fields = ['id', 'title', 'project', 'edit_data', 'created_at', 'updated_at']
+        read_only_fields = ('id', 'created_at', 'updated_at')
 
 class UserProfileSerializer(serializers.Serializer):
     email = serializers.EmailField()

@@ -25,6 +25,10 @@ urlpatterns = [
     path('playground/render/', views.PlaygroundRenderView.as_view(), name='playground_render'),
     path('playground/projects/', views.PlaygroundProjectListView.as_view(), name='playground_projects'),
     path('playground/projects/<uuid:pk>/', views.PlaygroundProjectDetailView.as_view(), name='playground_project_detail'),
+
+    # Video Editor Projects
+    path('video-editor/projects/', views.VideoEditorProjectListView.as_view(), name='video_editor_projects'),
+    path('video-editor/projects/<uuid:pk>/', views.VideoEditorProjectDetailView.as_view(), name='video_editor_project_detail'),
     
     # Dataset suggestions (no auth required)
     path('suggestions/', views.DatasetSuggestionsView.as_view(), name='dataset_suggestions'),

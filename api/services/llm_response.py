@@ -2,6 +2,7 @@ import os
 import io
 import base64
 import logging
+import requests
 from pydantic import BaseModel, Field
 from typing import Optional
 from dotenv import load_dotenv
@@ -29,15 +30,55 @@ YOUR PERSONALITY & SCOPE:
 
 TECHNICAL RULES FOR MANIM:
 - The Manim frame is 14.22 units wide and 8 units tall. The center is at (0, 0).
-- SAFE ZONE: Keep ALL objects within X: -6.5 to +6.5 and Y: -3.5 to +3.5 to avoid clipping.
+- SAFE ZONE: Keep all visible objects within the safe zone X(-6.5, 6.5), Y(-3.5, 3.5). For large VGroups, call scale_to_fit_width(12) or scale_to_fit_height(6.5), then center with move_to(ORIGIN). Do not place labels directly on the frame edge.
 - Use Scene class and construct method.
 - Return ONLY valid Python code in the 'code' field. No markdown formatting, no backticks.
 - Text and Font Rules: NEVER use font_size larger than 48. For long text, ALWAYS use .scale_to_fit_width(12).
-- Layout Rules: AVOID OVERLAPPING. Use VGroup(...).arrange(DOWN, buff=0.5) to stack objects.
+- Layout Rules: AVOID OVERLAPPING. Use VGroup(...).arrange(DOWN, buff=0.5) to stack objects. When adding text to shapes (like array boxes), explicitly position the text (e.g., text.move_to(box.get_center())) so they don't overlap at the origin.
 
 RESPONSE FORMAT:
 You must always respond by filling the provided structured schema (is_animation, chat_response, code).
 """
+
+MODAL_32B_MODEL_ID = "manimatic-qwen32b-modal"
+
+
+def _get_modal_32b_response(prompt, history=None):
+    modal_url = (os.getenv("MODAL_MANIMATIC_32B_URL") or "").rstrip("/")
+    if not modal_url:
+        raise RuntimeError("MODAL_MANIMATIC_32B_URL is not configured.")
+
+    timeout_seconds = int(os.getenv("MODAL_MANIMATIC_32B_TIMEOUT_SECONDS", "900"))
+    api_key = os.getenv("MODAL_MANIMATIC_32B_API_KEY")
+    headers = {}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    # The Modal endpoint owns the fine-tuned prompt/schema contract. We keep the
+    # backend request small so cold-start and inference time are the only delays.
+    payload = {
+        "prompt": prompt,
+        "complexity": os.getenv("MODAL_MANIMATIC_32B_DEFAULT_COMPLEXITY", "Medium"),
+        "category": os.getenv("MODAL_MANIMATIC_32B_DEFAULT_CATEGORY", "General Manim"),
+        "max_new_tokens": int(os.getenv("MODAL_MANIMATIC_32B_MAX_NEW_TOKENS", "1800")),
+        "temperature": float(os.getenv("MODAL_MANIMATIC_32B_TEMPERATURE", "0.1")),
+    }
+
+    response = requests.post(
+        f"{modal_url}/generate",
+        json=payload,
+        headers=headers,
+        timeout=timeout_seconds,
+    )
+    response.raise_for_status()
+    data = response.json()
+
+    return ManimResponse(
+        is_animation=bool(data.get("is_animation", False)),
+        chat_response=data.get("chat_response") or None,
+        code=data.get("code") or None,
+    )
+
 
 def get_llm_response(prompt, history=None, image_path=None, target_model='gemini-2.5-flash'):
     """
@@ -46,6 +87,30 @@ def get_llm_response(prompt, history=None, image_path=None, target_model='gemini
     
     if history is None:
         history = []
+
+    if target_model == MODAL_32B_MODEL_ID:
+        try:
+            return _get_modal_32b_response(prompt=prompt, history=history)
+        except requests.Timeout:
+            logger.exception("Modal 32B model timed out.")
+            return ManimResponse(
+                is_animation=False,
+                chat_response=(
+                    "The 32B Manimatic model is still waking up on Modal. "
+                    "Please try again in a moment."
+                ),
+                code=None,
+            )
+        except Exception as e:
+            logger.exception("Modal 32B model request failed: %s", e)
+            return ManimResponse(
+                is_animation=False,
+                chat_response=(
+                    "The 32B Manimatic model is temporarily unavailable. "
+                    "Please try again or switch to Gemini."
+                ),
+                code=None,
+            )
 
     # Initialize the base LLM
     if target_model == 'custom-manim-model':

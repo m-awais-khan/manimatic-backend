@@ -6,8 +6,8 @@ from rest_framework.authtoken.models import Token
 from django.shortcuts import get_object_or_404
 from django.contrib.auth.models import User
 from django.conf import settings as django_settings
-from .models import Scene, Chat, StitchedVideo, UserProfile, DataTrainingOptOut, PlaygroundProject, Project
-from .serializers import SceneSerializer, ChatSerializer, StitchedVideoSerializer, PlaygroundProjectSerializer, ProjectSerializer
+from .models import Scene, Chat, StitchedVideo, UserProfile, DataTrainingOptOut, PlaygroundProject, Project, VideoEditorProject
+from .serializers import SceneSerializer, ChatSerializer, StitchedVideoSerializer, PlaygroundProjectSerializer, ProjectSerializer, VideoEditorProjectSerializer
 import threading
 import requests
 import os
@@ -305,6 +305,7 @@ class WipeDataView(APIView):
         Project.objects.filter(user=request.user).delete()
         Chat.objects.filter(user=request.user).delete()
         PlaygroundProject.objects.filter(user=request.user).delete()
+        VideoEditorProject.objects.filter(user=request.user).delete()
         StitchedVideo.objects.filter(user=request.user).delete()
         return Response({'message': 'All data wiped'}, status=status.HTTP_204_NO_CONTENT)
 
@@ -451,6 +452,49 @@ class PlaygroundProjectDetailView(APIView):
         get_object_or_404(PlaygroundProject, pk=pk, user=request.user).delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
+class VideoEditorProjectListView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        project_id = request.query_params.get('project_id')
+        if not project_id:
+            return Response({'error': 'project_id required'}, status=status.HTTP_400_BAD_REQUEST)
+        projects = VideoEditorProject.objects.filter(user=request.user, project_id=project_id)
+        return Response(VideoEditorProjectSerializer(projects, many=True).data)
+
+    def post(self, request):
+        project_id = request.data.get('project_id')
+        if not project_id:
+            return Response({'error': 'project_id required'}, status=status.HTTP_400_BAD_REQUEST)
+        project = get_object_or_404(Project, id=project_id, user=request.user)
+        title = (request.data.get('title') or 'Untitled Edit').strip()[:255]
+        edit_data = request.data.get('edit_data', {})
+        if not isinstance(edit_data, dict):
+            return Response({'error': 'edit_data must be an object'}, status=status.HTTP_400_BAD_REQUEST)
+        editor_project = VideoEditorProject.objects.create(user=request.user, project=project, title=title, edit_data=edit_data)
+        return Response(VideoEditorProjectSerializer(editor_project).data, status=status.HTTP_201_CREATED)
+
+class VideoEditorProjectDetailView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, pk):
+        editor_project = get_object_or_404(VideoEditorProject, pk=pk, user=request.user)
+        return Response(VideoEditorProjectSerializer(editor_project).data)
+
+    def put(self, request, pk):
+        editor_project = get_object_or_404(VideoEditorProject, pk=pk, user=request.user)
+        editor_project.title = (request.data.get('title') or editor_project.title).strip()[:255]
+        edit_data = request.data.get('edit_data', editor_project.edit_data)
+        if not isinstance(edit_data, dict):
+            return Response({'error': 'edit_data must be an object'}, status=status.HTTP_400_BAD_REQUEST)
+        editor_project.edit_data = edit_data
+        editor_project.save()
+        return Response(VideoEditorProjectSerializer(editor_project).data)
+
+    def delete(self, request, pk):
+        get_object_or_404(VideoEditorProject, pk=pk, user=request.user).delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
 class SceneStatusView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -467,12 +511,24 @@ class StitchVideosView(APIView):
             return Response({'error': 'project_id required'}, status=status.HTTP_400_BAD_REQUEST)
         project = get_object_or_404(Project, id=project_id, user=request.user)
         
-        video_paths, title = request.data.get('video_paths', []), request.data.get('title', 'Stitched Video')
+        raw_clips = request.data.get('clips')
+        video_paths = request.data.get('video_paths', [])
+        title = request.data.get('title', 'Stitched Video')
+        if isinstance(raw_clips, list) and raw_clips:
+            video_paths = [clip.get('video_path') for clip in raw_clips if clip.get('video_path')]
         if not video_paths or len(video_paths) < 2:
             return Response({'error': 'Need 2+ videos.'}, status=status.HTTP_400_BAD_REQUEST)
         
+        edit_plan = None
+        if isinstance(raw_clips, list):
+            edit_plan = {
+                'clips': raw_clips,
+                'transitions': request.data.get('transitions', []),
+                'output': request.data.get('output', {}),
+            }
+
         sv = StitchedVideo.objects.create(title=title, source_video_paths=video_paths, status='pending', user=request.user, project=project)
-        threading.Thread(target=stitch_videos_task, args=(sv.id, request.data.get('transition', 'cut'))).start()
+        threading.Thread(target=stitch_videos_task, args=(sv.id, request.data.get('transition', 'cut'), edit_plan)).start()
         return Response(StitchedVideoSerializer(sv).data, status=status.HTTP_202_ACCEPTED)
 
 class StitchedVideoListView(APIView):

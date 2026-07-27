@@ -29,6 +29,7 @@ Requirements:
 - Include proper imports and scene class
 - Use Scene class and construct method (not create_animation)
 - Code should be production-ready and error-free
+- Layout Rules: When adding text to shapes (like array boxes), explicitly position the text (e.g., text.move_to(box.get_center())) so they don't overlap at the origin
 - Return ONLY Python code, no markdown formatting, no explanations
 - Do not wrap code in ```python or ``` blocks
 - Start directly with import statements
