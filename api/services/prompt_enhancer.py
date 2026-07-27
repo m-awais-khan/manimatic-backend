@@ -115,7 +115,7 @@ def _call_gemini(system_prompt: str) -> str:
 
     llm = ChatGoogleGenerativeAI(
         model="gemini-2.5-flash",
-        google_api_key=os.environ.get("GOOGLE_API_KEY"),
+        google_api_key=os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY"),
         config={"timeout": 30},
     )
     response = llm.invoke([HumanMessage(content=system_prompt)])
